@@ -553,3 +553,316 @@ LLM₀ ──产生数据──► 数据集 D₁ ──训练──► LLM₁
 如果这个类比成立，那么**软件工程下一阶段的核心技能，可能不是写代码，而是设计原子集**——选哪 9 个工具、定义什么样的最小原语，决定了上层能长出多丰饶的能力。
 
 这恰好是 McCarthy 1958 年做的事，也是 Church 1936 年做的事。**历史在更高的螺旋上重演。**
+
+---
+
+## 八、设计一个 LLM 原生的虚拟电子实验室
+
+把前面所有线索（符号求解器、原子工具、自进化、专家系统）落到一个具体产品上：**ElectroLab-LM**。
+
+### 8.1 设计原则
+
+1. **LLM 不替代 SPICE，LLM 包裹 SPICE**——精确数值仍由数值求解器负责，LLM 负责理解、规划、解释、迭代。
+2. **原子工具优先**——给 Agent ≈ 9 个原子工具，复杂功能由其组合派生。
+3. **一切可验证**——LLM 的每一个输出都要能被 SPICE / DRC / 单元测试反证。
+4. **闭环自进化**——产品在运行中持续产生训练数据。
+
+### 8.2 总体架构
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                        用户 (自然语言)                            │
+└────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌────────────────────────────────────────────────────────────────┐
+│                     Planner LLM (Opus 级)                       │
+│       ─ 拓扑选择 / 任务分解 / 调试推理 / 解释                    │
+└────────────────────────────────────────────────────────────────┘
+                               │ 调用原子工具
+                               ▼
+┌──────────┬──────────┬──────────┬──────────┬─────────┬─────────┐
+│ netlist  │ simulate │ measure  │ search   │ compute │ render  │
+│ 生成网表  │ 调SPICE  │ 提取指标 │ 查元件库 │ 符号代数│ 画波形  │
+├──────────┼──────────┼──────────┼──────────┼─────────┼─────────┤
+│  read    │  write   │   bash   │  recall  │  spawn  │         │
+│  文件    │   文件   │  逃生舱  │   记忆   │ 子Agent │         │
+└──────────┴──────────┴──────────┴──────────┴─────────┴─────────┘
+                               │
+                               ▼
+┌────────────────────────────────────────────────────────────────┐
+│   符号/数值后端：ngspice · Xyce · SymPy · Z3 · KLayout · gEDA   │
+└────────────────────────────────────────────────────────────────┘
+                               │
+                               ▼
+┌────────────────────────────────────────────────────────────────┐
+│   反馈环：仿真结果 → LLM 解读 → 修改设计 → 再仿真 → 收敛         │
+└────────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 原子工具集（9 个）
+
+```python
+def netlist(spec: str) -> Netlist            # spec → SPICE 网表
+def simulate(net: Netlist, mode: str)        # .OP/.AC/.TRAN/.NOISE/.MC
+def measure(wave: Wave, metric: str)         # 提取 f / THD / margin / 裕度
+def search(query: str) -> list[Component]    # 元件库检索
+def compute(expr: str)                       # SymPy / 数值求值
+def render(data, kind: str)                  # 波形/Bode/Smith
+def read(path)  / write(path, content)       # 文件 IO
+def bash(cmd)                                # 调外部 EDA 工具
+def spawn(role, task)                        # 派生子 Agent (布局/良率)
+```
+
+任何更高级功能（"设计 PLL"、"修这个振荡器"）都是这 9 个原子的**宏组合**——和 Lisp 一样。
+
+### 8.4 数据合成：从符号引擎反向"挤"训练数据
+
+LLM 训练最贵的是数据。**电子领域的优势：拥有完美的符号验证器（SPICE）**——可以无限合成可验证的高质量数据。
+
+**合成管线**：
+
+```
+教科书电路模板 (≈ 1000 个) ──┐
+随机参数采样          ──────┤
+拓扑变异 (GA)         ──────┼─► 网表 ──► SPICE 仿真 ──► (网表, 指标)
+故障注入 (元件偏差)   ──────┘                            │
+                                                          ▼
+                                              过滤(收敛/合理)
+                                                          │
+                                                          ▼
+                                              LLM 反向标注：
+                                              "这是什么电路？为什么用这个值？
+                                               指标是否合理？怎么改进？"
+                                                          │
+                                                          ▼
+                                              (问题, 推理链, 答案)
+```
+
+**五类合成数据**：
+
+| 数据类型 | 生成方式 | 用途 |
+|---|---|---|
+| **正向设计**（指标 → 网表） | 模板 + 参数采样 + SPICE 验证 | SFT 主菜 |
+| **反向解释**（网表 → 指标 + 解释） | SPICE 跑结果 + LLM 文字化 | 教学/调试 |
+| **故障诊断**（坏电路 → 找 bug） | 注入元件错误 + 对比正确版 | RL 高价值 |
+| **优化轨迹**（迭代改进） | 真实优化器 trace | Chain-of-Thought |
+| **多轮对话**（用户 ↔ Agent） | LLM 自演 + 评分 | 对话能力 |
+
+**关键技巧：拒绝采样（Rejection Sampling）**
+
+```python
+for trace in 10_000 candidates:
+    if not spice_converges(trace.netlist): drop()
+    if not meets_spec(trace.metrics, trace.target): drop()
+    if not llm_judge(trace.reasoning) > threshold: drop()
+    keep(trace)   # 也许只剩 5%
+```
+
+这就是 **DeepSeek-R1 / o1 风格的"用验证器筛数据"**——把 SPICE 当成数学领域的 Lean。
+
+### 8.5 SFT（监督微调）设计
+
+**阶段 0：基座模型**——选 Qwen3-Coder / DeepSeek / Llama-4 之类有强代码 + 数学能力的开源底座。
+
+**阶段 1：领域语料继续预训练（CPT）**
+
+```
+─ 教科书：Sedra/Smith、Razavi、Gray-Meyer (≈ 50M tokens)
+─ SPICE 文档 + 模型卡（BSIM4 全部参数说明）
+─ 元器件 datasheet（数百 GB，要 OCR + 抽取）
+─ 应用笔记（TI / ADI / Maxim app notes）
+─ 学术论文（IEEE TCAS、JSSC）
+─ 仿真日志（自家合成）
+```
+
+**阶段 2：SFT 数据格式（指令 + 工具使用 + 推理）**
+
+```json
+{
+  "instruction": "设计一个 1 kHz 文氏桥振荡器，5V 单电源，THD < 1%",
+  "thinking": "文氏桥需要 A_v ≥ 3 才起振；为压低 THD 要加 AGC...",
+  "tool_calls": [
+    {"name": "compute", "args": "f=1/(2*pi*R*C), 取 R=16k → C=10n"},
+    {"name": "search",  "args": "JFET for AGC, Vp around 2V → 2N5457"},
+    {"name": "netlist", "args": "<wien-bridge template>"},
+    {"name": "simulate","args": "{net, '.TRAN 0 50ms'}"},
+    {"name": "measure", "args": "THD"}
+  ],
+  "observation": "THD = 0.6%, f = 998 Hz",
+  "answer": "<最终网表 + 解释>"
+}
+```
+
+**关键：thinking 字段必须真实经过 SPICE 验证**——否则就是教 LLM 编故事。
+
+**阶段 3：分层 SFT**
+
+```
+SFT-1  基础工具调用（10 万样本，模板化）
+SFT-2  单步推理 + 验证（30 万，含拒绝采样）
+SFT-3  多步迭代调试（10 万，真实 trace）
+SFT-4  对话式设计（5 万，多轮）
+```
+
+每一阶段用上一阶段的模型 **+ 更难的数据 + 更严的过滤**——课程学习（curriculum）。
+
+### 8.6 蒸馏（Distillation）设计
+
+目标：把 Opus 级 Planner 的能力压到能跑在工程师本地的 Sonnet/Haiku 级模型。
+
+**两条路线**：
+
+**A. 黑盒蒸馏（response-level）**
+
+```
+Teacher (Opus) ──► 生成 (问题, 完整推理 + 工具轨迹 + 答案)
+                    │
+                    ▼
+            SPICE 验证 + 指标过滤
+                    │
+                    ▼
+Student (Haiku) ── SFT on filtered traces
+```
+
+数量级：百万级合成 trace，过滤后保留 10–20%。
+
+**B. 白盒蒸馏（logit-level）**
+
+如果 teacher 权重可得（自家训的）：
+
+```
+Loss = α · CE(student, gold) + β · KL(student || teacher)
+```
+
+对工具调用 token 的 KL 权重要更高——这是知识密集区。
+
+**C. 推测解码（Speculative Decoding）做线上加速**
+
+小模型先猜 → 大模型验证。在网表生成这种**结构强、模板多**的任务上，speedup 能到 3-5 ×。
+
+**蒸馏的特殊技巧：保留"工具调用轨迹"而非只保留答案**
+
+电路设计的价值在过程（哪一步选了什么、为什么否决某拓扑），而不是最终网表。蒸馏时要让 student 学**整条 trace**。
+
+### 8.7 RL 设计：用 SPICE 当奖励模型
+
+这是整个系统的灵魂。SPICE 是天然的、零幻觉的奖励函数。
+
+**奖励函数设计**：
+
+```python
+def reward(trace):
+    if not spice_converges(trace.netlist):     return -1.0
+    metrics = simulate(trace.netlist)
+    
+    r_spec   = spec_match(metrics, trace.target)      # 指标命中
+    r_margin = margin_score(metrics)                  # 裕度（起振/相位/温度）
+    r_cost   = -bom_cost(trace.netlist)               # BOM 成本
+    r_steps  = -0.01 * len(trace.tool_calls)          # 鼓励简洁
+    r_robust = monte_carlo_yield(trace.netlist)       # 良率
+    
+    return w1*r_spec + w2*r_margin + w3*r_cost + w4*r_steps + w5*r_robust
+```
+
+注意：**这是 RLVR（RL with Verifiable Rewards）**，没有人类偏好模型，没有 reward hacking 的常见漏洞——因为 SPICE 不会被 prompt 骗。
+
+**算法选择**：
+
+| 阶段 | 算法 | 原因 |
+|---|---|---|
+| 起步 | **GRPO**（DeepSeek 风格） | 不需要 critic，简单稳定 |
+| 进阶 | **PPO + 工具调用裁剪** | 长 trajectory 必备 |
+| 探索 | **MCTS-on-LLM**（AlphaProof 风格） | 拓扑搜索空间大 |
+
+**Trajectory 设计**：
+
+```
+state    = (用户需求, 当前网表, 历史仿真结果)
+action   = 一次工具调用
+reward   = 终止时根据指标计算（稀疏奖励）
+         + 中间步骤的 shaping（每次仿真收敛 +0.01）
+```
+
+**课程学习（关键）**：
+
+```
+Level 1  分压器 / 滤波器 (单元件)
+Level 2  共射放大器（直流偏置）
+Level 3  振荡器（环路稳定性）
+Level 4  锁相环 PLL（多环路）
+Level 5  Sigma-Delta ADC（混合信号）
+Level 6  完整子系统（电源 + MCU + 模拟前端）
+```
+
+每一级用上一级的模型初始化，否则探索空间爆炸。
+
+**防止 Reward Hacking**：
+
+电路里一个常见 hack：模型把元件值调成极端理想化（比如 R = 1e-9）让指标"完美"。对策：
+
+- 元件值必须在标准 E12/E24 系列内（离散约束）
+- BOM 必须从真实供应商库里选（KiCad / LCSC API）
+- 加 **物理合理性 critic**：温度、功耗、击穿电压
+
+### 8.8 自进化闭环
+
+```
+        ┌─────────────────────────────────────────┐
+        │                                          │
+        ▼                                          │
+   v0 模型 ──► 用户使用 ──► trace 收集 ──► 自动评分 ──┘
+                              │
+                              ▼
+                    高分 trace → SFT 数据池
+                    低分 trace → RL 反例池
+                    异常 trace → 人工审核（少量）
+                              │
+                              ▼
+                          下一版模型 v1
+```
+
+每周/每月一次迭代。**这就是 Lisp 自举（self-hosting）在 LLM 时代的版本**——产品在运行中改进自己。
+
+### 8.9 评估基准（Bench）
+
+没有可比的指标，训练就是开盲盒。需要建立：
+
+| 维度 | 测试集 | 指标 |
+|---|---|---|
+| 拓扑选择正确率 | 1000 道题 | top-1 acc |
+| 指标命中率 | 各种 spec | spec-match @1, @5 |
+| 一次过通过率 | 真实任务 | first-pass yield |
+| 调试能力 | 注入故障的电路 | 找出+修复时间 |
+| BOM 优化 | 同指标下成本 | 相对基线 |
+| 鲁棒性 | 蒙特卡洛良率 | 6σ 通过率 |
+| 解释质量 | 人评 + LLM-judge | Likert 1–5 |
+
+可以参考 **VerilogEval / RTLLM / AnalogBench / CircuitNet**，并自建模拟版基准。
+
+### 8.10 落地路线图（最小可行路径）
+
+```
+Month 1-2   ─ 搭工具层：netlist/simulate/measure 三件套打通
+Month 3-4   ─ 合成 100 万训练样本（拓扑 100 种 × 参数采样）
+Month 4-6   ─ SFT v0：能写出收敛的振荡器 / 滤波器 / 放大器
+Month 6-8   ─ RL v1：起振裕度、THD、BOM 多目标优化
+Month 8-12  ─ Beta：嵌入到 KiCad / EasyEDA 作为 Copilot
+Year 2      ─ 自进化数据闭环 + 蒸馏小模型本地跑
+Year 3      ─ 扩展到混合信号 / RF / 电源系统
+```
+
+### 8.11 失败模式与对策
+
+| 风险 | 表现 | 对策 |
+|---|---|---|
+| 幻觉网表 | 引用不存在的元件 | 元件库做硬约束，工具层校验 |
+| 过拟合模板 | 只会改教科书电路 | 拓扑变异 + 真实问题混入 |
+| 长上下文崩溃 | 多轮调试后乱掉 | 工作记忆压缩 + 状态外置（写文件） |
+| 优化器卡死 | 多目标 reward 拉扯 | Pareto 前沿 + 用户偏好向量 |
+| 训练-推理鸿沟 | 训练时 SPICE 完美，推理时元件容差垮 | 训练就加蒙特卡洛 |
+
+### 8.12 一句话总结
+
+> **把 SPICE 当 Lean，把电路当定理，把工程师当用户**——剩下的就是 LLM 在符号验证回路里的 RL + 自进化。  
+> 9 个原子工具决定了能力上限；SPICE 决定了真实性下限；课程数据决定了学习速度；自进化闭环决定了能跑多远。
